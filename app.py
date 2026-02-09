@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 import tempfile
 import uuid
 from flask import Flask, request, abort, send_from_directory
@@ -111,63 +112,77 @@ def handle_text_message(event):
                 )
                 return
 
-            # Start Processing
+            # Start Processing in Thread
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(text=f"OK！{len(session['images'])}枚の写真から、最高のアルバムを作るね…🔥\nちょっと待ってて！")
+                TextSendMessage(text=f"OK！{len(session['images'])}枚の写真から、最高のアルバムを作るね…🔥\n（枚数が多いと1〜2分かかるかも！ちょっと待ってて！）")
             )
             
-            try:
-                # 1. Select Best Photos (Optional now? User wants all if possible, or pagination)
-                # If user wants ALL images preserved but just paginated, we skip selection or select ALL.
-                # User said: "input images / 5 output images". "25 input -> 5 output".
-                # So we should probably preserve MOST images, maybe filtering only really bad ones.
-                # For now, let's keep it simple: Use ALL input images.
-                selected_paths = session['images'] 
-                
-                # 2. Get Captions
-                captions = gemini.generate_captions(session['location'], session['date'])
-                title = captions.get('title', 'Travel Memory')
-                loc_romaji = captions.get('location_romaji', session['location']) # Fallback to original
-                
-                # 3. Create Images (Pages)
-                # Pass loc_romaji
-                pages = img_svc.create_album_pages(selected_paths, title=title, date=session['date'], location_romaji=loc_romaji)
-                
-                messages = []
-                messages.append(TextSendMessage(text=f"{captions.get('comment', 'できたよー！')}\n場所: {loc_romaji}"))
-                
-                host_url = os.getenv("HOST_URL", "https://example.com")
-                
-                for i, page in enumerate(pages):
-                    unique_filename = f"{uuid.uuid4()}.jpg"
-                    output_path = os.path.join("static/images", unique_filename)
-                    page.save(output_path, quality=95) # High quality
-                    
-                    image_url = f"{host_url}/static/images/{unique_filename}"
-                    
-                    # Add to messages
-                    messages.append(ImageSendMessage(original_content_url=image_url, preview_image_url=image_url))
-                
-                # LINE allows max 5 messages per push. If > 5, we need multiple pushes.
-                # Chunk messages
-                def chunk_list(l, n):
-                    for i in range(0, len(l), n):
-                        yield l[i:i + n]
+            # Copy session data for thread
+            session_data = {
+                'location': session['location'],
+                'date': session['date'],
+                'images': session['images'][:] 
+            }
+            
+            # Reset session immediately
+            session['status'] = 'idle'
+            session['images'] = []
+            
+            # Run background task
+            thread = threading.Thread(target=generate_album_task, args=(user_id, session_data))
+            thread.start()
 
-                for chunk in chunk_list(messages, 5):
-                    line_bot_api.push_message(user_id, chunk)
-                
-                # Reset session
-                session['status'] = 'idle'
-                session['images'] = []
-                
-            except Exception as e:
-                app.logger.error(f"Error processing album: {e}")
-                line_bot_api.push_message(
-                    user_id,
-                    TextSendMessage(text="ごめん！アルバム作成中にエラーが出ちゃった💦 もう一回試してみて！")
-                )
+        else:
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="写真を送るか、「完了」って言ってね！")
+            )
+
+def generate_album_task(user_id, session_data):
+    try:
+        # 1. Select Best Photos (Use all for now)
+        selected_paths = session_data['images']
+        
+        # 2. Get Captions
+        captions = gemini.generate_captions(session_data['location'], session_data['date'])
+        title = captions.get('title', 'Travel Memory')
+        loc_romaji = captions.get('location_romaji', session_data['location'])
+        
+        # 3. Create Images
+        pages = img_svc.create_album_pages(selected_paths, title=title, date=session_data['date'], location_romaji=loc_romaji)
+        
+        messages = []
+        messages.append(TextSendMessage(text=f"{captions.get('comment', 'できたよー！')}\n場所: {loc_romaji}"))
+        
+        host_url = os.getenv("HOST_URL", "https://example.com")
+        
+        for i, page in enumerate(pages):
+            unique_filename = f"{uuid.uuid4()}.jpg"
+            output_path = os.path.join("static/images", unique_filename)
+            page.save(output_path, quality=85) # slightly lower quality for speed
+            
+            image_url = f"{host_url}/static/images/{unique_filename}"
+            messages.append(ImageSendMessage(original_content_url=image_url, preview_image_url=image_url))
+        
+        # Chunk messages
+        def chunk_list(l, n):
+            for i in range(0, len(l), n):
+                yield l[i:i + n]
+
+        for chunk in chunk_list(messages, 5):
+            line_bot_api.push_message(user_id, chunk)
+            
+    except Exception as e:
+        app.logger.error(f"Error processing album: {e}")
+        try:
+            line_bot_api.push_message(
+                user_id,
+                TextSendMessage(text="ごめん！アルバム作成中にエラーが出ちゃった💦 もう一回試してみて！")
+            )
+        except:
+            pass
+
         else:
             line_bot_api.reply_message(
                 event.reply_token,
