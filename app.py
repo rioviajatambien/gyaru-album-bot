@@ -212,10 +212,10 @@ def handle_image_message(event):
     print(f"Received image for {user_id}. Count: {len(session['images'])}")
 
 
+# Create dirs (Ensure these exist for Gunicorn too)
+os.makedirs("tmp", exist_ok=True)
+os.makedirs("static/images", exist_ok=True)
+
 if __name__ == "__main__":
-    # Create dirs
-    os.makedirs("tmp", exist_ok=True)
-    os.makedirs("static/images", exist_ok=True)
-    
     port = int(os.environ.get('PORT', 8000))
     app.run(host='0.0.0.0', port=port)
